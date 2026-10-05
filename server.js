@@ -3,8 +3,13 @@ const http = require('http');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const dotenv = require('dotenv');
+const fs = require('fs');
+const path = require('path');
+const { randomUUID } = require('crypto');
 const { WebSocketServer } = require('ws');
 const Anthropic = require('@anthropic-ai/sdk');
+
+const { ensureStorage, readStore, writeStore, addChatEntry, addTask, addNote, updateTask, updateNote, updateSettings, getDashboardPayload } = require('./src/store');
 
 dotenv.config();
 
@@ -19,9 +24,11 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 
 const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
 
+ensureStorage();
+
 const state = {
   appName: APP_NAME,
-  backendUrl: process.env.JARVIS_BACKEND_URL || 'https://jarvis-backend.local',
+  backendUrl: process.env.JARVIS_BACKEND_URL || 'http://127.0.0.1:3000',
   apiKey: process.env.JARVIS_API_KEY || '',
   isKIEnabled: parseBool(process.env.JARVIS_ENABLE_KI, true),
   allowWebSearch: parseBool(process.env.JARVIS_ENABLE_WEB_SEARCH, false),
@@ -36,6 +43,7 @@ const state = {
   connectionSummary: 'Jarvis Backend ist bereit.',
   wsConnections: 0,
   anthropicAvailable: !!anthropic,
+  version: '3.0.0',
 };
 
 const clients = new Set();
@@ -76,26 +84,34 @@ function sanitizeConfig(input = {}) {
   return nextConfig;
 }
 
-function buildSystemPrompt(context) {
+function buildSystemPrompt(context = {}) {
+  const allowCode = Boolean(context.allowCodeGeneration);
+  const allowDesign = Boolean(context.allowDesign);
+  const allowWeb = Boolean(context.allowWebSearch);
+
   let prompt = 'Du bist JARVIS, ein intelligenter virtueller Assistent.\n\n';
   prompt += 'Fähigkeiten:\n';
   prompt += '- Fragen beantworten und Probleme lösen\n';
-  prompt += '- Code in JavaScript, TypeScript, Python, Java, C++, HTML, CSS, SQL und Bash schreiben\n';
+  prompt += '- Code in JavaScript, TypeScript, Python, Java, C++, HTML, CSS, SQL, Bash und JSON schreiben\n';
   prompt += '- UI/UX-Designs, Layouts und Farbkonzepte entwickeln\n';
-  prompt += '- Fehler debuggen und Lösungen vorschlagen\n';
-  prompt += '- Dokumentation und Erklärungen erstellen\n\n';
+  prompt += '- Fehler debuggen, Code reviewen und Lösungen vorschlagen\n';
+  prompt += '- Texte zusammenfassen, übersetzen und strukturieren\n';
+  prompt += '- Projekt- und Aufgabenverwaltung mit Tasks, Notizen und Settings unterstützen\n\n';
   prompt += 'Sprache: Deutsch\n';
   prompt += 'Antwortstil: klar, hilfreich, strukturiert und professionell\n';
   prompt += 'Wenn du Code gibst, nutze Markdown-Codeblöcke mit Sprachbezeichnung.\n\n';
 
-  if (context.allowCodeGeneration) {
-    prompt += 'Code-Generierung ist erlaubt.\n';
-  }
-  if (context.allowDesign) {
-    prompt += 'Design-Unterstützung ist erlaubt.\n';
-  }
-  if (context.allowWebSearch) {
-    prompt += 'Web-Recherche ist erlaubt.\n';
+  if (allowCode) prompt += 'Code-Generierung ist erlaubt.\n';
+  if (allowDesign) prompt += 'Design-Unterstützung ist erlaubt.\n';
+  if (allowWeb) prompt += 'Web-Recherche ist erlaubt.\n';
+
+  if (context.history && context.history.length) {
+    prompt += '\nVorherige Konversation:\n';
+    context.history.slice(-6).forEach((entry) => {
+      if (entry && entry.role && entry.content) {
+        prompt += `${entry.role}: ${entry.content}\n`;
+      }
+    });
   }
 
   return prompt;
@@ -105,15 +121,15 @@ function buildBasicReply(message) {
   const lower = (message || '').toLowerCase();
 
   if (!message || !message.trim()) {
-    return 'Ich bin JARVIS. Wie kann ich dir helfen? Ich kann Fragen beantworten, Code schreiben, Designideen entwickeln und Fehler analysieren.';
+    return 'Ich bin JARVIS. Wie kann ich dir helfen? Ich kann Fragen beantworten, Code schreiben, Designideen entwickeln, Notizen verwalten und Aufgaben organisieren.';
   }
 
   if (lower.includes('hilfe') || lower.includes('help')) {
-    return 'Ich bin JARVIS und kann dir helfen mit: Fragen beantworten, Code generieren, Designkonzepte entwickeln, Fehler debuggen und Dokumentation schreiben.';
+    return 'Ich bin JARVIS und kann dir helfen mit: Fragen beantworten, Code generieren, Designkonzepte entwickeln, Fehler debuggen, Notizen und Tasks verwalten, Übersetzen und Zusammenfassen.';
   }
 
   if (lower.includes('status') || lower.includes('zustand')) {
-    return `Systemstatus: ${state.isConnected ? 'verbunden' : 'bereit'}. KI: ${state.isKIEnabled ? 'aktiv' : 'aus'}. Code: ${state.allowCodeGeneration ? 'aktiv' : 'aus'}. Design: ${state.allowDesign ? 'aktiv' : 'aus'}.`;
+    return `Systemstatus: ${state.isConnected ? 'verbunden' : 'bereit'}. KI: ${state.isKIEnabled ? 'aktiv' : 'aus'}. Code: ${state.allowCodeGeneration ? 'aktiv' : 'aus'}. Design: ${state.allowDesign ? 'aktiv' : 'aus'}. Aufgaben: ${readStore().tasks.length}. Notizen: ${readStore().notes.length}.`;
   }
 
   if (lower.includes('code') || lower.includes('programm') || lower.includes('funktion') || lower.includes('script')) {
@@ -128,10 +144,20 @@ function buildBasicReply(message) {
     return 'Ich kann Fehleranalyse und Debugging machen. Schick mir den Fehler, Stacktrace oder Codeausschnitt und ich erkläre die Ursache und die Lösung.';
   }
 
-  return `Ich habe deine Anfrage verstanden: "${message}". Ich kann dir damit weiterhelfen, sei es mit Antworten, Code, Designideen oder Debugging.`;
+  if (lower.includes('task') || lower.includes('aufgabe') || lower.includes('todo')) {
+    return 'Task- und Aufgabenverwaltung ist aktiv. Ich kann dir Aufgaben anlegen, priorisieren, aktualisieren und als Liste verwalten.';
+  }
+
+  if (lower.includes('notiz') || lower.includes('note')) {
+    return 'Notizenverwaltung ist aktiv. Ich kann dir Notizen speichern, abrufen und organisieren.';
+  }
+
+  return `Ich habe deine Anfrage verstanden: "${message}". Ich kann dir damit weiterhelfen, sei es mit Antworten, Code, Designideen, Debugging, Notizen, Tasks oder Übersetzungen.`;
 }
 
 async function generateSmartResponse(message, context = {}) {
+  const history = Array.isArray(context.history) ? context.history : [];
+
   if (!anthropic) {
     return buildBasicReply(message);
   }
@@ -140,7 +166,7 @@ async function generateSmartResponse(message, context = {}) {
     const response = await anthropic.messages.create({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 2048,
-      system: buildSystemPrompt(context),
+      system: buildSystemPrompt({ ...context, history }),
       messages: [{ role: 'user', content: message }],
     });
 
@@ -175,6 +201,7 @@ function emitStateUpdate() {
       agentMode: state.agentMode,
       wsConnections: state.wsConnections,
       anthropicAvailable: state.anthropicAvailable,
+      version: state.version,
     },
   });
 
@@ -202,16 +229,60 @@ function authMiddleware(req, res, next) {
   }
 }
 
+function addChatTurn(role, content) {
+  const store = readStore();
+  const entry = {
+    id: randomUUID(),
+    role,
+    content,
+    createdAt: new Date().toISOString(),
+  };
+  store.chatHistory.push(entry);
+  if (store.chatHistory.length > 200) {
+    store.chatHistory = store.chatHistory.slice(-200);
+  }
+  writeStore(store);
+  return entry;
+}
+
+function normalizeTaskInput(input = {}) {
+  return {
+    id: input.id || randomUUID(),
+    title: String(input.title || 'Neue Aufgabe'),
+    description: String(input.description || ''),
+    status: ['open', 'doing', 'done'].includes(input.status) ? input.status : 'open',
+    priority: ['low', 'medium', 'high'].includes(input.priority) ? input.priority : 'medium',
+    createdAt: input.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function normalizeNoteInput(input = {}) {
+  return {
+    id: input.id || randomUUID(),
+    title: String(input.title || 'Neue Notiz'),
+    content: String(input.content || ''),
+    createdAt: input.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 app.get('/health', (req, res) => {
+  const store = readStore();
   res.json({
     ok: true,
     app: APP_NAME,
     status: state.isConnected ? 'connected' : 'ready',
     timestamp: new Date().toISOString(),
-    version: '2.0.0',
+    version: state.version,
+    capabilityCount: {
+      tasks: store.tasks.length,
+      notes: store.notes.length,
+      chatMessages: store.chatHistory.length,
+    },
     capabilities: {
       ai: state.isKIEnabled,
       codeGeneration: state.allowCodeGeneration,
@@ -247,6 +318,7 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 app.get('/api/config', authMiddleware, (req, res) => {
+  const store = readStore();
   res.json({
     ok: true,
     config: {
@@ -265,6 +337,8 @@ app.get('/api/config', authMiddleware, (req, res) => {
       connectionSummary: state.connectionSummary,
       websocketEnabled: true,
       anthropicAvailable: state.anthropicAvailable,
+      version: state.version,
+      userSettings: store.settings,
     },
   });
 });
@@ -320,9 +394,7 @@ app.post('/api/check-connection', authMiddleware, async (req, res) => {
 
     state.isConnected = response.ok;
     state.lastCheckedAt = new Date().toISOString();
-    state.connectionSummary = response.ok
-      ? `Verbindung erfolgreich geprüft: ${targetUrl}`
-      : `Backend erreichbar, aber Fehlerstatus ${response.status}.`;
+    state.connectionSummary = response.ok ? `Verbindung erfolgreich geprüft: ${targetUrl}` : `Backend erreichbar, aber Fehlerstatus ${response.status}.`;
 
     emitStateUpdate();
 
@@ -346,40 +418,23 @@ app.get('/api/agents', authMiddleware, (req, res) => {
   res.json({
     ok: true,
     agents: [
-      {
-        id: 'assistant',
-        name: 'Allgemeiner Assistent',
-        description: 'Beantwortet Fragen und analysiert Probleme',
-        active: true,
-        icon: '💬',
-        capabilities: ['qa', 'analysis', 'chat'],
-      },
-      {
-        id: 'coder',
-        name: 'Code-Generator',
-        description: 'Generiert und erklärt Code in vielen Sprachen',
-        active: state.allowCodeGeneration,
-        icon: '💻',
-        capabilities: ['javascript', 'python', 'java', 'cpp', 'sql', 'html', 'css'],
-      },
-      {
-        id: 'designer',
-        name: 'Design-Spezialist',
-        description: 'Erstellt Layouts, Farbkonzepte und UI/UX-Ideen',
-        active: state.allowDesign,
-        icon: '🎨',
-        capabilities: ['ui', 'ux', 'layout', 'colors', 'components'],
-      },
-      {
-        id: 'debugger',
-        name: 'Fehler-Debugger',
-        description: 'Hilft bei der Analyse und Lösung von Bugs',
-        active: true,
-        icon: '🔍',
-        capabilities: ['debugging', 'stacktrace', 'fixes'],
-      },
+      { id: 'assistant', name: 'Allgemeiner Assistent', description: 'Beantwortet Fragen und analysiert Probleme', active: true, icon: '💬', capabilities: ['qa', 'analysis', 'chat'] },
+      { id: 'coder', name: 'Code-Generator', description: 'Generiert und erklärt Code in vielen Sprachen', active: state.allowCodeGeneration, icon: '💻', capabilities: ['javascript', 'python', 'java', 'cpp', 'sql', 'html', 'css'] },
+      { id: 'designer', name: 'Design-Spezialist', description: 'Erstellt Layouts, Farbkonzepte und UI/UX-Ideen', active: state.allowDesign, icon: '🎨', capabilities: ['ui', 'ux', 'layout', 'colors', 'components'] },
+      { id: 'debugger', name: 'Fehler-Debugger', description: 'Hilft bei der Analyse und Lösung von Bugs', active: true, icon: '🔍', capabilities: ['debugging', 'stacktrace', 'fixes'] },
+      { id: 'notes', name: 'Notizen', description: 'Verwaltet Notizen, Aufgaben und persönliche Einstellungen', active: true, icon: '📝', capabilities: ['notes', 'tasks', 'settings'] },
     ],
   });
+});
+
+app.get('/api/dashboard', authMiddleware, (req, res) => {
+  const payload = getDashboardPayload();
+  res.json({ ok: true, dashboard: payload });
+});
+
+app.get('/api/chat/history', authMiddleware, (req, res) => {
+  const store = readStore();
+  res.json({ ok: true, history: store.chatHistory.slice(-50) });
 });
 
 app.post('/api/assistant/message', authMiddleware, async (req, res) => {
@@ -390,16 +445,22 @@ app.post('/api/assistant/message', authMiddleware, async (req, res) => {
     return res.status(503).json({ ok: false, message: 'KI ist deaktiviert. Aktiviere sie in den Einstellungen.', reply: null });
   }
 
+  const store = readStore();
+  const history = store.chatHistory.slice(-12);
+
   try {
     const aiContext = {
       allowCodeGeneration: state.allowCodeGeneration,
       allowDesign: state.allowDesign,
       allowWebSearch: state.allowWebSearch,
       agentMode: context.agentMode || state.agentMode,
+      history,
       ...context,
     };
 
     const reply = await generateSmartResponse(message, aiContext);
+    addChatTurn('user', message);
+    addChatTurn('assistant', reply);
 
     return res.json({
       ok: true,
@@ -407,6 +468,7 @@ app.post('/api/assistant/message', authMiddleware, async (req, res) => {
       reply,
       timestamp: new Date().toISOString(),
       anthropic: state.anthropicAvailable,
+      history: readStore().chatHistory.slice(-12),
     });
   } catch (error) {
     return res.status(500).json({
@@ -447,6 +509,36 @@ app.post('/api/code/generate', authMiddleware, async (req, res) => {
   }
 });
 
+app.post('/api/code/review', authMiddleware, async (req, res) => {
+  const { code, language, context } = req.body || {};
+  if (!code || !String(code).trim()) {
+    return res.status(400).json({ ok: false, message: 'Code is required.' });
+  }
+
+  try {
+    const prompt = `Bitte prüfe den folgenden ${language || 'Code'} qualitativ und nenne:\n1. mögliche Bugs\n2. Performance-Probleme\n3. Sicherheitsprobleme\n4. Verbesserungsvorschläge\n\nCode:\n${code}\n\nZusätzlicher Kontext:\n${context || 'Kein zusätzlicher Kontext.'}`;
+    const review = await generateSmartResponse(prompt, { allowCodeGeneration: true, allowDesign: false, allowWebSearch: true });
+    return res.json({ ok: true, review, timestamp: new Date().toISOString() });
+  } catch (error) {
+    return res.status(500).json({ ok: false, message: 'Code-Review fehlgeschlagen.', error: error.message });
+  }
+});
+
+app.post('/api/code/test', authMiddleware, async (req, res) => {
+  const { code, language, description } = req.body || {};
+  if (!code) {
+    return res.status(400).json({ ok: false, message: 'Code is required.' });
+  }
+
+  try {
+    const prompt = `Erstelle sinnvolle Unit-Tests bzw. Beispiel-Tests für folgenden ${language || 'Code'}:\nBeschreibung: ${description || 'Keine Beschreibung'}\n\nCode:\n${code}`;
+    const tests = await generateSmartResponse(prompt, { allowCodeGeneration: true, allowDesign: false, allowWebSearch: false });
+    return res.json({ ok: true, tests, timestamp: new Date().toISOString() });
+  } catch (error) {
+    return res.status(500).json({ ok: false, message: 'Test-Generierung fehlgeschlagen.', error: error.message });
+  }
+});
+
 app.post('/api/design/concept', authMiddleware, async (req, res) => {
   if (!state.allowDesign) {
     return res.status(403).json({ ok: false, message: 'Design ist deaktiviert.' });
@@ -477,6 +569,18 @@ app.post('/api/design/concept', authMiddleware, async (req, res) => {
   }
 });
 
+app.post('/api/design/palette', authMiddleware, async (req, res) => {
+  const { brand, style } = req.body || {};
+
+  try {
+    const prompt = `Erstelle 5 sinnvolle Farben für ein ${style || 'modernes'} Design mit Branding "${brand || 'JARVIS'}". Gib nur eine klare Farbpalette mit HEX-Codes und kurzer Begründung.`;
+    const palette = await generateSmartResponse(prompt, { allowDesign: true, allowCodeGeneration: false, allowWebSearch: false });
+    return res.json({ ok: true, palette, timestamp: new Date().toISOString() });
+  } catch (error) {
+    return res.status(500).json({ ok: false, message: 'Farbpalette konnte nicht erzeugt werden.', error: error.message });
+  }
+});
+
 app.post('/api/debug/analyze', authMiddleware, async (req, res) => {
   const { error, code, context: debugContext } = req.body || {};
 
@@ -491,24 +595,133 @@ app.post('/api/debug/analyze', authMiddleware, async (req, res) => {
 
     const analysis = await generateSmartResponse(prompt, { allowCodeGeneration: true, allowDesign: false, allowWebSearch: true });
 
-    return res.json({
-      ok: true,
-      analysis,
-      timestamp: new Date().toISOString(),
-    });
+    return res.json({ ok: true, analysis, timestamp: new Date().toISOString() });
   } catch (error) {
-    return res.status(500).json({
-      ok: false,
-      message: 'Fehleranalyse fehlgeschlagen.',
-      error: error.message,
-    });
+    return res.status(500).json({ ok: false, message: 'Fehleranalyse fehlgeschlagen.', error: error.message });
   }
 });
 
+app.post('/api/translate', authMiddleware, async (req, res) => {
+  const { text, targetLanguage } = req.body || {};
+  if (!text) {
+    return res.status(400).json({ ok: false, message: 'Text is required.' });
+  }
+
+  try {
+    const prompt = `Übersetze den folgenden Text ins ${targetLanguage || 'Englische'} und gib nur die Übersetzung zurück.\n\nText:\n${text}`;
+    const translated = await generateSmartResponse(prompt, { allowCodeGeneration: false, allowDesign: false, allowWebSearch: false });
+    return res.json({ ok: true, translated, timestamp: new Date().toISOString() });
+  } catch (error) {
+    return res.status(500).json({ ok: false, message: 'Übersetzung fehlgeschlagen.', error: error.message });
+  }
+});
+
+app.post('/api/summary', authMiddleware, async (req, res) => {
+  const { text } = req.body || {};
+  if (!text) {
+    return res.status(400).json({ ok: false, message: 'Text is required.' });
+  }
+
+  try {
+    const prompt = `Fasse den folgenden Text klar und prägnant zusammen. Gib eine kurze Zusammenfassung mit Hauptpunkten.\n\nText:\n${text}`;
+    const summary = await generateSmartResponse(prompt, { allowCodeGeneration: false, allowDesign: false, allowWebSearch: false });
+    return res.json({ ok: true, summary, timestamp: new Date().toISOString() });
+  } catch (error) {
+    return res.status(500).json({ ok: false, message: 'Zusammenfassung fehlgeschlagen.', error: error.message });
+  }
+});
+
+app.get('/api/tasks', authMiddleware, (req, res) => {
+  const store = readStore();
+  res.json({ ok: true, tasks: store.tasks });
+});
+
+app.post('/api/tasks', authMiddleware, (req, res) => {
+  const task = normalizeTaskInput(req.body || {});
+  const store = readStore();
+  store.tasks.unshift(task);
+  writeStore(store);
+  res.status(201).json({ ok: true, task });
+});
+
+app.patch('/api/tasks/:id', authMiddleware, (req, res) => {
+  const store = readStore();
+  const index = store.tasks.findIndex((t) => t.id === req.params.id);
+  if (index === -1) {
+    return res.status(404).json({ ok: false, message: 'Task not found.' });
+  }
+
+  const updated = {
+    ...store.tasks[index],
+    ...req.body,
+    updatedAt: new Date().toISOString(),
+  };
+  store.tasks[index] = updated;
+  writeStore(store);
+  res.json({ ok: true, task: updated });
+});
+
+app.delete('/api/tasks/:id', authMiddleware, (req, res) => {
+  const store = readStore();
+  const before = store.tasks.length;
+  store.tasks = store.tasks.filter((task) => task.id !== req.params.id);
+  writeStore(store);
+  res.json({ ok: true, deleted: before !== store.tasks.length });
+});
+
+app.get('/api/notes', authMiddleware, (req, res) => {
+  const store = readStore();
+  res.json({ ok: true, notes: store.notes });
+});
+
+app.post('/api/notes', authMiddleware, (req, res) => {
+  const note = normalizeNoteInput(req.body || {});
+  const store = readStore();
+  store.notes.unshift(note);
+  writeStore(store);
+  res.status(201).json({ ok: true, note });
+});
+
+app.patch('/api/notes/:id', authMiddleware, (req, res) => {
+  const store = readStore();
+  const index = store.notes.findIndex((n) => n.id === req.params.id);
+  if (index === -1) {
+    return res.status(404).json({ ok: false, message: 'Note not found.' });
+  }
+
+  const updated = {
+    ...store.notes[index],
+    ...req.body,
+    updatedAt: new Date().toISOString(),
+  };
+  store.notes[index] = updated;
+  writeStore(store);
+  res.json({ ok: true, note: updated });
+});
+
+app.delete('/api/notes/:id', authMiddleware, (req, res) => {
+  const store = readStore();
+  const before = store.notes.length;
+  store.notes = store.notes.filter((note) => note.id !== req.params.id);
+  writeStore(store);
+  res.json({ ok: true, deleted: before !== store.notes.length });
+});
+
+app.get('/api/settings', authMiddleware, (req, res) => {
+  const store = readStore();
+  res.json({ ok: true, settings: store.settings });
+});
+
+app.post('/api/settings', authMiddleware, (req, res) => {
+  const updated = updateSettings(req.body || {});
+  res.json({ ok: true, settings: updated });
+});
+
 app.get('/', (req, res) => {
+  const store = readStore();
   res.json({
     app: APP_NAME,
-    version: '2.0.0',
+    version: state.version,
     status: state.isConnected ? 'connected' : 'ready',
     capabilities: {
       ai: state.isKIEnabled,
@@ -517,6 +730,12 @@ app.get('/', (req, res) => {
       debugging: true,
       websocket: true,
       anthropic: state.anthropicAvailable,
+      tasks: true,
+      notes: true,
+      settings: true,
+      chatHistory: true,
+      translation: true,
+      summaries: true,
     },
     auth: {
       login: '/api/auth/login',
@@ -529,10 +748,17 @@ app.get('/', (req, res) => {
       config: ['/api/config (GET)', '/api/config (POST)'],
       assistant: '/api/assistant/message',
       agents: '/api/agents',
-      code: '/api/code/generate',
-      design: '/api/design/concept',
+      dashboard: '/api/dashboard',
+      tasks: ['/api/tasks (GET)', '/api/tasks (POST)', '/api/tasks/:id (PATCH/DELETE)'],
+      notes: ['/api/notes (GET)', '/api/notes (POST)', '/api/notes/:id (PATCH/DELETE)'],
+      settings: ['/api/settings (GET)', '/api/settings (POST)'],
+      code: ['/api/code/generate', '/api/code/review', '/api/code/test'],
+      design: ['/api/design/concept', '/api/design/palette'],
       debug: '/api/debug/analyze',
+      translate: '/api/translate',
+      summary: '/api/summary',
       websocket: 'ws://localhost:' + PORT + '/ws',
+      stats: { tasks: store.tasks.length, notes: store.notes.length, chats: store.chatHistory.length },
     },
   });
 });
@@ -554,6 +780,7 @@ wss.on('connection', (socket) => {
         codeGeneration: state.allowCodeGeneration,
         design: state.allowDesign,
       },
+      version: state.version,
     },
   }));
 
@@ -580,14 +807,14 @@ wss.on('connection', (socket) => {
 
 server.listen(PORT, () => {
   console.log('\n============================================================');
-  console.log('JARVIS Backend v2.0.0 läuft!');
+  console.log('JARVIS Backend v3.0.0 läuft!');
   console.log('============================================================');
   console.log(`Server: http://localhost:${PORT}`);
   console.log(`WebSocket: ws://localhost:${PORT}/ws`);
   console.log('Login-Daten:');
   console.log(`Username: ${ADMIN_USERNAME}`);
   console.log(`Password: ${ADMIN_PASSWORD}`);
-  console.log('Fähigkeiten: Fragen, Code, Design, Debugging');
+  console.log('Fähigkeiten: Fragen, Code, Design, Debugging, Tasks, Notizen, Settings, Übersetzung, Zusammenfassung');
   console.log('Anthropic verbunden:', state.anthropicAvailable ? 'ja' : 'nein');
   console.log('============================================================\n');
 });
